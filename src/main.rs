@@ -1,115 +1,117 @@
-#![no_std]  // 標準ライブラリ(std)を使わない。OS/UEFI環境ではstdが前提とするOS機能が無いから。
-#![no_main] // Rust標準のmain()を使わない。UEFIが呼ぶエントリポイントを自分で定義するから。
+#![no_std]  // Do not use the standard library. In OS/UEFI environments, the OS features required by `std` do not exist.
+#![no_main] // Do not use Rust’s default `main()`. We define our own entry point that UEFI calls.
 
-use core::mem::offset_of; // 構造体フィールドのオフセット検証に使う（Cレイアウトと一致してるか確認）。
-use core::mem::size_of;   // サイズ計算（framebufferサイズ→要素数に変換）に使う。
+use core::mem::offset_of; // Used to verify struct field offsets (to ensure they match the C layout).
+use core::mem::size_of;   // Used for size calculations (e.g., converting framebuffer size to element count).
 use core::panic::PanicInfo;
-use core::ptr::null_mut;  // UEFI呼び出し時のnullポインタ生成に使う。
-use core::slice;          // 生ポインタからスライスを作る（framebufferを配列として扱う）。
+use core::ptr::null_mut;  // Used to create null pointers for UEFI calls.
+use core::slice;          // Used to create slices from raw pointers (treat framebuffer as an array).
 
-// UEFIの型をRust側で最小限に表現するための型エイリアス。
-// UEFIはC系の世界なので「void*」「handle」みたいな概念が出る。
-type EfiVoid = u8;     // Cで言う void のダミー表現（*mut EfiVoid == void* 相当）
-type EfiHandle = u64;  // UEFIのハンドル（本ではu64で扱ってる）
-type Result<T> = core::result::Result<T, &'static str>; // 例外がないno_std環境で簡易エラー返しをするため。
+// Type aliases to minimally represent UEFI types on the Rust side.
+// UEFI is a C-based world, so concepts like `void*` and `handle` appear.
+type EfiVoid = u8;     // Dummy representation of C's `void` (*mut EfiVoid == void*)
+type EfiHandle = u64;  // UEFI handle (treated as u64 in the book)
+type Result<T> = core::result::Result<T, &'static str>; // Simple error handling for no_std environments.
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
 #[must_use]
-#[repr(u64)] // UEFIのStatusは整数値（ここではu64扱い）としてABIに合わせる。
+#[repr(u64)] // UEFI status codes are integers; we match the ABI by using u64.
 enum EfiStatus {
-    Success = 0, // 成功コード。失敗コードは今は省略してる（必要になったら追加）。
+    Success = 0, // Success code. Failure codes are omitted for now.
 }
 
-// --- ここが「UEFIが呼び出す入口」 ---
-#[no_mangle] // Rustの名前マングリングを無効化して、UEFI側がシンボル名を見つけられるようにする。
+// --- Entry point called by UEFI ---
+#[no_mangle] // Disable Rust name mangling so UEFI can find the symbol.
 fn efi_main(_image_handle: EfiHandle, efi_system_table: &EfiSystemTable) {
-    // 目的：UEFIが提供する「Graphics Output Protocol(GOP)」を探して取得する。
-    // GOPが取れると、フレームバッファ（画面ピクセルの生メモリ）のアドレス等がわかる。
+    // Purpose: Locate and obtain the UEFI Graphics Output Protocol (GOP).
+    // Once GOP is available, we can get the framebuffer (raw pixel memory) address.
     let efi_graphics_output_protocol = locate_graphic_protocol(efi_system_table).unwrap();
 
-    // 目的：フレームバッファ（VRAM相当）の開始アドレスとサイズを得る。
+    // Purpose: Obtain the framebuffer (VRAM-equivalent) base address and size.
     let vram_addr = efi_graphics_output_protocol.mode.frame_buffer_base;
     let vram_byte_size = efi_graphics_output_protocol.mode.frame_buffer_size;
 
-    // 目的：生アドレス（usize）を「u32配列」として扱えるようにする。
+    // Purpose: Treat the raw address (usize) as a `u32` array.
     //
-    // - GOPのフレームバッファは多くの環境で 32bpp（1ピクセル=4バイト）なので u32 として塗れる。
-    // - unsafeなのは「このアドレスが本当に有効で、かつこの長さ分書き込んで良い」保証がRustには無いから。
+    // - In most environments, the GOP framebuffer is 32bpp (1 pixel = 4 bytes),
+    //   so we can safely write pixels as `u32`.
+    // - This is unsafe because Rust cannot guarantee that this address is valid
+    //   or writable for the given length.
     let vram = unsafe {
         slice::from_raw_parts_mut(
-            vram_addr as *mut u32,                  // 先頭アドレス
-            vram_byte_size / size_of::<u32>(),      // 要素数（バイト→u32個数）
+            vram_addr as *mut u32,             // Base address
+            vram_byte_size / size_of::<u32>(), // Number of elements (bytes → u32 count)
         )
     };
 
-    // 目的：全ピクセルを白(0xFFFFFFFF)で塗りつぶして「画面に何か出た」を確認する。
-    // これが「printlnの代替を作る前に、描画できることをまず確認」のステップ。
+    // Purpose: Fill all pixels with white (0xFFFFFFFF) to confirm that drawing works.
+    // This is a preliminary step before implementing a println-like text output.
     for e in vram {
         *e = 0xFFFFFFFF;
     }
 
-    // ここで「本当は文字描画」をやりたいが、まだprintln相当は無いのでコメントアウト。
+    // Eventually we want to draw text here, but we do not have println yet.
     // println!("Hello, world!");
     loop {}
 }
 
-// --- UEFIのテーブル定義（必要な部分だけ） ---
-// 目的：UEFIの「System Table」「Boot Services Table」をRustから叩くために
-// C互換レイアウトで構造体を定義する。
-// UEFIは巨大な構造体を持つので、必要なフィールドだけを「予約領域スキップ」で表現している。
-#[repr(C)] // Cと同じメモリレイアウトにする（これが無いとフィールド配置がズレて即クラッシュし得る）。
+// --- UEFI table definitions (only the required parts) ---
+// Purpose: Define the UEFI System Table and Boot Services Table in Rust
+// using a C-compatible layout so we can call into UEFI.
+// UEFI tables are huge, so we skip unused fields with reserved padding.
+#[repr(C)] // Ensure the same memory layout as C (without this, field offsets may differ and crash).
 struct EfiBootServicesTable {
-    // 目的：locate_protocolが来るまでのフィールドを丸ごとスキップする。
-    // [u64; 40] = 40*8 = 320バイト分の「穴」。
+    // Purpose: Skip all fields up to `locate_protocol`.
+    // [u64; 40] = 40 * 8 = 320 bytes of padding.
     _reserved0: [u64; 40],
 
-    // 目的：UEFIのBoot Servicesが提供する関数ポインタ。
-    // locate_protocolは「指定GUIDのプロトコル（GOPなど）を見つけて、そのインタフェースを返す」ために使う。
-    // extern "win64" はUEFIの呼び出し規約に合わせるため（x86_64 UEFIではMS ABI寄りになる）。
+    // Purpose: Function pointer provided by UEFI Boot Services.
+    // `locate_protocol` finds a protocol (e.g., GOP) by GUID and returns its interface.
+    // `extern "win64"` matches the UEFI calling convention (MS ABI on x86_64).
     locate_protocol: extern "win64" fn(
-        protocol: *const EfiGuid,     // 取得したいプロトコルのGUID
-        registration: *const EfiVoid, // 通常はnull（高度な使い方をしないならnull）
-        interface: *mut *mut EfiVoid, // 見つかったプロトコルのポインタがここに返る（out param）
+        protocol: *const EfiGuid,     // GUID of the protocol to locate
+        registration: *const EfiVoid, // Usually null (advanced usage only)
+        interface: *mut *mut EfiVoid, // Out parameter: pointer to the protocol interface
     ) -> EfiStatus,
 }
 
-// 目的：フィールドオフセットが本の想定（=UEFI仕様の配置）と一致しているかをコンパイル時に検証。
-// ずれてたら「UEFIの別の関数ポインタを呼ぶ」事故になるので、ビルド時に落として防ぐ。
+// Purpose: Verify at compile time that the field offset matches the expected UEFI layout.
+// If this is wrong, we may end up calling a completely different function pointer.
 const _: () = assert!(offset_of!(EfiBootServicesTable, locate_protocol) == 320);
 
 #[repr(C)]
 struct EfiSystemTable {
-    // 目的：boot_servicesフィールドが来るまでの領域をスキップする。
-    // 12*8 = 96バイト分。
+    // Purpose: Skip fields until `boot_services`.
+    // 12 * 8 = 96 bytes.
     _reserved0: [u64; 12],
 
-    // 目的：Boot Services Tableへの参照を持つ。
-    // ここから locate_protocol などのUEFIサービス関数にアクセスできる。
+    // Purpose: Reference to the Boot Services Table.
+    // From here, we can access UEFI service functions like `locate_protocol`.
     pub boot_services: &'static EfiBootServicesTable,
 }
 
-// 同じく、boot_servicesの位置が正しいか検証。
+// Again, verify the field offset.
 const _: () = assert!(offset_of!(EfiSystemTable, boot_services) == 96);
 
-// --- GUID（プロトコル識別子） ---
-// 目的：UEFIの各プロトコルはGUIDで識別される。
-// GOPを取るには「GOPのGUID」を指定して locate_protocol を呼ぶ必要がある。
-// そのためまず、GUID構造体を定義するところから。
+// --- GUID (protocol identifier) ---
+// Purpose: Each UEFI protocol is identified by a GUID.
+// To obtain GOP, we must pass the GOP GUID to `locate_protocol`.
+// First, we define the GUID structure.
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct EfiGuid {
-    // GUIDは4つの16ビット整数（data0, data1, data2, data3）で構成される。
-    // data0: 32ビット整数
-    // data1: 16ビット整数
-    // data2: 16ビット整数
-    // data3: 8バイトの配列
+    // A GUID consists of four parts:
+    // data0: 32-bit integer
+    // data1: 16-bit integer
+    // data2: 16-bit integer
+    // data3: 8-byte array
     pub data0: u32,
     pub data1: u16,
     pub data2: u16,
     pub data3: [u8; 8],
 }
 
-// GOPのGUID（UEFI仕様で決まっている値）。
+// The GOP GUID (fixed value defined by the UEFI specification).
 const EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID: EfiGuid = EfiGuid {
     data0: 0x9042a9de,
     data1: 0x23dc,
@@ -117,34 +119,35 @@ const EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID: EfiGuid = EfiGuid {
     data3: [0x96, 0xfb, 0x7a, 0xde, 0xd0, 0x80, 0x51, 0x6a],
 };
 
-// --- GOP（Graphics Output Protocol）の最小定義 ---
-// 目的：GOP構造体の中から「mode」を辿って framebuffer_base / framebuffer_size を得る。
-// ここもUEFIのC構造体をRustで最小限再現している。
+// --- Minimal definition of GOP (Graphics Output Protocol) ---
+// Purpose: Access `mode` to retrieve `frame_buffer_base` and `frame_buffer_size`.
+// This is a minimal Rust reimplementation of the UEFI C structure.
 #[repr(C)]
 #[derive(Debug)]
 struct EfiGraphicsOutputProtocol<'a> {
-    // 目的：先頭にある不要フィールド（関数ポインタ等）をスキップする。
-    // 本の段階では「modeだけ欲しい」のでreservedにしている。
+    // Purpose: Skip unused leading fields (e.g., function pointers).
+    // At this stage, we only care about `mode`.
     reserved: [u64; 3],
 
-    // 目的：現在のグラフィックモード情報へのポインタ。
+    // Purpose: Pointer to the current graphics mode information.
     pub mode: &'a EfiGraphicsOutputProtocolMode<'a>,
 }
 
 #[repr(C)]
 #[derive(Debug)]
 struct EfiGraphicsOutputProtocolMode<'a> {
-    // 目的：現在のモードに関する情報。
-    // max_mode / mode は「モード数」「現在モード番号」等。
+    // Purpose: Information about available and current modes.
+    // `max_mode` is the number of supported modes.
+    // `mode` is the current mode index.
     pub max_mode: u32,
     pub mode: u32,
 
-    // 目的：解像度やピクセル形式情報へのポインタ。
+    // Purpose: Pointer to resolution and pixel format information.
     pub info: &'a EfiGraphicsOutputProtocolPixelInfo,
     pub size_of_info: u64,
 
-    // 目的：フレームバッファ（描画メモリ）の先頭アドレスとサイズ。
-    // ここを取れれば「メモリ書き換えで画面を塗れる」。
+    // Purpose: Base address and size of the framebuffer (drawing memory).
+    // Once we have these, we can draw by writing to memory.
     pub frame_buffer_base: usize,
     pub frame_buffer_size: usize,
 }
@@ -152,37 +155,35 @@ struct EfiGraphicsOutputProtocolMode<'a> {
 #[repr(C)]
 #[derive(Debug)]
 struct EfiGraphicsOutputProtocolPixelInfo {
-    // 目的：解像度など、描画時に必要になる情報（文字描画やライン描画で使う）。
+    // Purpose: Information needed for drawing (e.g., text or line rendering).
     version: u32,
     pub horizontal_resolution: u32,
     pub vertical_resolution: u32,
 
-    // 目的：構造体サイズ/配置をUEFI仕様に合わせるためのパディング。
-    // 本では必要なフィールド以外をまとめて捨てている。
+    // Purpose: Padding to match the UEFI structure layout.
     _padding0: [u32; 5],
 
-    // 目的：1行あたりのピクセル数（解像度の横幅と同じとは限らない）。
-    // 次の行に移るときの計算で重要になる（stride相当）。
+    // Purpose: Number of pixels per scan line (stride).
+    // This may differ from horizontal_resolution and is important for row calculations.
     pub pixels_per_scan_line: u32,
 }
 
-// 目的：構造体サイズが想定どおりかを検証。
-// サイズが違うと後続フィールドの位置がズレるので危険。
+// Purpose: Verify that the structure size matches expectations.
+// A size mismatch would shift subsequent fields and break everything.
 const _: () = assert!(size_of::<EfiGraphicsOutputProtocolPixelInfo>() == 36);
 
-// --- GOPを探す処理 ---
-
-// 目的：System Table → Boot Services → locate_protocol を呼び、GOPのインターフェースポインタを得る。
-// ここが「UEFIとやり取りしてフレームバッファ情報を取る」中心。
+// --- Locate GOP ---
+// Purpose: Call System Table → Boot Services → locate_protocol to obtain GOP.
+// This is the core interaction with UEFI to retrieve framebuffer information.
 fn locate_graphic_protocol<'a>(
     efi_system_table: &EfiSystemTable,
 ) -> Result<&'a EfiGraphicsOutputProtocol<'a>> {
-    // locate_protocol が返す「GOPのポインタ」を受け取るための変数（out param）。
+    // Out parameter to receive the GOP pointer from `locate_protocol`.
     let mut graphic_output_protocol = null_mut::<EfiGraphicsOutputProtocol>();
 
-    // 目的：GUID指定でGOPを検索し、見つかったら interface にポインタが入る。
-    // registrationは通常null。
-    // interfaceは void** なので型を合わせるためにキャストしている。
+    // Purpose: Locate GOP by GUID.
+    // `registration` is usually null.
+    // `interface` is a void** in UEFI, so we cast accordingly.
     let status = (efi_system_table.boot_services.locate_protocol)(
         &EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID,
         null_mut::<EfiVoid>(),
@@ -190,18 +191,19 @@ fn locate_graphic_protocol<'a>(
             as *mut *mut EfiVoid,
     );
 
-    // 目的：失敗したらエラー。
+    // Purpose: Return an error if the protocol could not be found.
     if status != EfiStatus::Success {
         return Err("Failed to locate graphics output protocol");
     }
 
-    // 目的：取得した生ポインタを参照に変換して返す。
-    // unsafe理由：nullじゃないこと・正しい型であることをRustが保証できないため。
+    // Purpose: Convert the raw pointer into a reference and return it.
+    // Unsafe because Rust cannot guarantee that the pointer is valid or non-null.
     Ok(unsafe { &*graphic_output_protocol })
 }
 
-// --- panic時の挙動 ---
-// no_std環境ではpanicの出力先が無いので、最低限「止まる」だけのpanic handlerを用意する。
+// --- Panic behavior ---
+// In a no_std environment, there is no default panic output.
+// We define a minimal panic handler that simply halts execution.
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
     loop {}
