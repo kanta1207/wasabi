@@ -1,0 +1,13 @@
+[build]
+# Setting cargo run/build target to UEFI. Telling it that environment is without OS, std.
+# Without this setting, Cargo will create binaries for the host system(e.g x86_64-apple-darwin for MacOS, x86_64-unknown-linux-gnu for Linux)
+target = 'x86_64-unknown-uefi'
+
+rustflags = ["-Cforce-unwind-tables", "-Cforce-frame-pointers", "-Cno-redzone"]
+
+[unstable]
+build-std = ["core", "compiler_builtins", "alloc", "panic_abort"]
+build-std-features = ["compiler-builtins-mem"]
+
+[target.'cfg(target_os = "uefi")']
+runner = "bash scripts/launch_qemu.sh"
