@@ -1,16 +1,18 @@
-#![no_std]  // Do not use the standard library. In OS/UEFI environments, the OS features required by `std` do not exist.
+#![no_std]
+// Do not use the standard library. In OS/UEFI environments, the OS features required by `std` do not exist.
 #![no_main] // Do not use Rust’s default `main()`. We define our own entry point that UEFI calls.
 
+use core::arch::asm;
 use core::mem::offset_of; // Used to verify struct field offsets (to ensure they match the C layout).
-use core::mem::size_of;   // Used for size calculations (e.g., converting framebuffer size to element count).
+use core::mem::size_of; // Used for size calculations (e.g., converting framebuffer size to element count).
 use core::panic::PanicInfo;
-use core::ptr::null_mut;  // Used to create null pointers for UEFI calls.
-use core::slice;          // Used to create slices from raw pointers (treat framebuffer as an array).
+use core::ptr::null_mut; // Used to create null pointers for UEFI calls.
+use core::slice; // Used to create slices from raw pointers (treat framebuffer as an array).
 
 // Type aliases to minimally represent UEFI types on the Rust side.
 // UEFI is a C-based world, so concepts like `void*` and `handle` appear.
-type EfiVoid = u8;     // Dummy representation of C's `void` (*mut EfiVoid == void*)
-type EfiHandle = u64;  // UEFI handle (treated as u64 in the book)
+type EfiVoid = u8; // Dummy representation of C's `void` (*mut EfiVoid == void*)
+type EfiHandle = u64; // UEFI handle (treated as u64 in the book)
 type Result<T> = core::result::Result<T, &'static str>; // Simple error handling for no_std environments.
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
@@ -52,7 +54,9 @@ fn efi_main(_image_handle: EfiHandle, efi_system_table: &EfiSystemTable) {
 
     // Eventually we want to draw text here, but we do not have println yet.
     // println!("Hello, world!");
-    loop {}
+    loop {
+        hlt();
+    }
 }
 
 // --- UEFI table definitions (only the required parts) ---
@@ -187,8 +191,7 @@ fn locate_graphic_protocol<'a>(
     let status = (efi_system_table.boot_services.locate_protocol)(
         &EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID,
         null_mut::<EfiVoid>(),
-        &mut graphic_output_protocol as *mut *mut EfiGraphicsOutputProtocol
-            as *mut *mut EfiVoid,
+        &mut graphic_output_protocol as *mut *mut EfiGraphicsOutputProtocol as *mut *mut EfiVoid,
     );
 
     // Purpose: Return an error if the protocol could not be found.
@@ -201,10 +204,16 @@ fn locate_graphic_protocol<'a>(
     Ok(unsafe { &*graphic_output_protocol })
 }
 
+pub fn hlt() {
+    unsafe { asm!("hlt") }
+}
+
 // --- Panic behavior ---
 // In a no_std environment, there is no default panic output.
 // We define a minimal panic handler that simply halts execution.
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
-    loop {}
+    loop {
+        hlt();
+    }
 }
