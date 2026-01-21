@@ -6,6 +6,7 @@ use core::mem::size_of;   // Used for size calculations (e.g., converting frameb
 use core::panic::PanicInfo;
 use core::ptr::null_mut;  // Used to create null pointers for UEFI calls.
 use core::slice;          // Used to create slices from raw pointers (treat framebuffer as an array).
+use core::arch::asm;
 
 // Type aliases to minimally represent UEFI types on the Rust side.
 // UEFI is a C-based world, so concepts like `void*` and `handle` appear.
@@ -52,7 +53,9 @@ fn efi_main(_image_handle: EfiHandle, efi_system_table: &EfiSystemTable) {
 
     // Eventually we want to draw text here, but we do not have println yet.
     // println!("Hello, world!");
-    loop {}
+    loop {
+        hlt();
+    }
 }
 
 // --- UEFI table definitions (only the required parts) ---
@@ -201,10 +204,16 @@ fn locate_graphic_protocol<'a>(
     Ok(unsafe { &*graphic_output_protocol })
 }
 
+pub fn hlt(){
+    unsafe { asm!("hlt") }
+}
+
 // --- Panic behavior ---
 // In a no_std environment, there is no default panic output.
 // We define a minimal panic handler that simply halts execution.
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
-    loop {}
+    loop {
+        hlt();
+    }
 }
